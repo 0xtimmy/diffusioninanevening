@@ -1,10 +1,11 @@
-%matplotlib inline
-%config InlineBackend.figure_format = "retina"
+#%matplotlib inline
+#%config InlineBackend.figure_format = "retina"
 
 import random
 from collections import namedtuple
 from pathlib import Path
 from functools import lru_cache
+import os
 
 import matplotlib.pyplot as plt
 import torch as th
@@ -14,6 +15,10 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
+import datetime
+import time
+from IPython.display import clear_output
+from IPython.display import display
 th.backends.cudnn.benchmark = True
 
 class Config:
@@ -26,24 +31,25 @@ class Config:
 def show(x):
     if not isinstance(x, th.Tensor) or x.ndim == 4:
         x = th.cat(tuple(x), -1)
-    display(TF.to_pil_image(x))
+    #display(TF.to_pil_image(x))
+    #Image.open((TF.to_pil_image(x)))
+    #TF.to_pil_image(x).show()
 
 def get_dataset(name):
     if Path(name).exists():
         print(f"dataset '{name}' already exists; skipping...")
         return
-    !git clone https://huggingface.co/datasets/huggan/{name} && (cd {name} && git lfs pull)
+    #!git clone https://huggingface.co/datasets/huggan/{name} && (cd {name} && git lfs pull)
     import pyarrow.parquet as pq
     from io import BytesIO
 
+    os.mkdir(Path(name))
+
     i = 0
-    for table in Path(f"{name}/data").glob("*.parquet"):
+    for table in Path(f"{name}-raw/data").glob("*.parquet"):
         for row in tqdm(pq.read_table(table)[0]):
             Image.open(BytesIO(row["bytes"].as_py())).save(f"{name}/{i:04d}.jpg")
             i += 1
-get_dataset(Config.dataset)
-
-Sample = namedtuple("Sample", ("im", "noisy_im", "noise_level"))
 
 def alpha_blend(a, b, alpha):
     return alpha * a + (1 - alpha) * b
@@ -66,8 +72,6 @@ class Dataset(th.utils.data.Dataset):
         noisy_im = alpha_blend(noise, im, noise_level)
         return Sample(im, noisy_im, noise_level)
 
-d_train = Dataset(Config.dataset)
-
 def demo_dataset(dataset, n=16):
     print(f"Dataset has {len(dataset)} samples (not counting augmentation).")
     print(f"Here are some samples from the dataset:")
@@ -77,14 +81,11 @@ def demo_dataset(dataset, n=16):
     show(s.noise_level.expand(3, 16, Config.hw) for s in samples)
     print(f"Target Outputs")
     show(s.im for s in samples)
-demo_dataset(d_train)
+
+Sample = namedtuple("Sample", ("im", "noisy_im", "noise_level"))
 
 def to_device(ims):
     return Sample(*(x.to(Config.device) for x in ims))
-
-for batch in tqdm(th.utils.data.DataLoader(d_train, num_workers=2, batch_size=32)): to_device(batch)
-
-Prediction = namedtuple("Prediction", ("denoised"))
 
 def conv(n_in, n_out, **kwargs):
     return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
@@ -113,6 +114,8 @@ def Enc(n_in, n_out, n_b):
 def Dec(n_in, n_out, n_b):
     return nn.Sequential(Blocks(n_in, n_out, n_b), nn.Upsample(scale_factor=2))
 
+Prediction = namedtuple("Prediction", ("denoised"))
+
 class UNet(nn.Module):
     def __init__(self, n_io=Config.channels, n_f=(64, 64, 64, 64, 64), n_b=(2, 2, 2, 2, 2)):
         super().__init__()
@@ -131,12 +134,9 @@ class UNet(nn.Module):
             x = dec(x) + skips.pop()
         return Prediction(self.out(x))
 
-model = UNet().to(Config.device)
-
 def weight_average(w_prev, w_new, n):
     alpha = min(0.95, n / 10)
     return alpha_blend(w_prev, w_new, alpha)
-avg_model = th.optim.swa_utils.AveragedModel(model, avg_fn=weight_average)
 
 @th.no_grad()
 def demo_model(model, n=16):
@@ -149,7 +149,6 @@ def demo_model(model, n=16):
     print(f"Here are some model outputs on random noise:")
     show(y.denoised.clamp(0, 1))
     model.train()
-demo_model(model)
 
 @th.no_grad()
 def generate_images(model, n_images=16, n_steps=100, step_size=2.0):
@@ -165,13 +164,7 @@ def generate_images(model, n_images=16, n_steps=100, step_size=2.0):
 
 def demo_image_generation(model):
     print("Here are some generated images (for an untrained model, they will be blank gray squares)")
-    show(generate_images(avg_model, n_images=16))
-demo_image_generation(avg_model)
-
-import os
-import datetime
-import time
-from IPython.display import clear_output
+    show(generate_images(model, n_images=16))
 
 
 class Visualizer:
@@ -200,17 +193,22 @@ class Visualizer:
             generated_images = generate_images(model, n_images=n_demo)
             clear_output(wait=True)
             print("Input Noisified Image, Noise Level")
-            show(x.noisy_im[:n_demo])
-            show(x.noise_level.expand(len(x.noise_level), 3, 16, Config.hw)[:n_demo])
+            #show(x.noisy_im[:n_demo])
+            TF.to_pil_image(x.noisy_im[:n_demo]).save("./noise.jpg")
+            #show(x.noise_level.expand(len(x.noise_level), 3, 16, Config.hw)[:n_demo])
             print("Predictions")
-            show(y.denoised[:n_demo].clamp(0, 1))
+            #show(y.denoised[:n_demo].clamp(0, 1))
+            TF.to_pil_image(y.denoised[:n_demo].clamp(0, 1)).save("./predictions.jpg")
             print("Targets")
-            show(x.im[:n_demo])
+            #show(x.im[:n_demo])
+            TF.to_pil_image(x.im[:n_demo]).save("./targets.jpg")
             self.steps.append(self.step)
             self.avg_losses.append(sum(self.losses_since_last_vis) / len(self.losses_since_last_vis))
             self.losses_since_last_vis = []
             print("Generated Images (Averaged Model)")
-            show(generated_images)
+            #show(generated_images)
+            TF.to_pil_image(generated_images).save("./output.jpg")
+            plt.ion()
             plt.title("Losses")
             plt.plot(self.steps, self.avg_losses)
             plt.gcf().set_size_inches(16, 4)
@@ -222,7 +220,7 @@ class Visualizer:
                     self.folder / f"generated_{self.step:07d}.jpg", quality=95)
                 plt.gcf().savefig(self.folder / "stats.jpg")
                 self.t_last_save = t
-            plt.show()
+            plt.draw()
             self.t_last_vis = t
         print(
             f"\r{self.step: 5d} Steps; {int(t - self.t_start): 3d} Seconds; "
@@ -252,7 +250,7 @@ class Trainer:
         self.opt = th.optim.AdamW(model.parameters(), 3e-4, amsgrad=True)
         num_workers = min(8, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())
         self.dataloader = th.utils.data.DataLoader(Looper(dataset), batch_size=batch_size, shuffle=True, drop_last=True,
-                                                   num_workers=num_workers)
+                                                num_workers=num_workers)
         self.dl_iter = iter(self.dataloader)
         self.visualizer = Visualizer()
 
@@ -276,16 +274,39 @@ class Trainer:
             self.train_step(time.time())
 
     def train_step(self, t):
+        print("training...")
         x = self.get_batch()
+        print("got batch")
         y = self.model(x.noisy_im, x.noise_level)
+        print("modeled")
         loss = F.mse_loss(y.denoised, x.im)
+        print(f"loss: {loss}")
         self.opt.zero_grad();
+        print('zero gradded')
         loss.backward();
+        print("backward")
         self.opt.step();
+        print("opt step")
         self.avg_model_step(t)
+        print("model step")
         self.visualizer(self.avg_model, t, x, y, loss.item())
+        print("visualized")
 
 
-trainer = Trainer(model, avg_model, d_train)
-trainer.train(n_seconds=60*60)
+if __name__ == '__main__':
+    get_dataset(Config.dataset)
 
+    d_train = Dataset(Config.dataset)
+    demo_dataset(d_train)
+
+    for batch in tqdm(th.utils.data.DataLoader(d_train, num_workers=2, batch_size=32)): to_device(batch)
+
+    model = UNet().to(Config.device)
+
+    avg_model = th.optim.swa_utils.AveragedModel(model, avg_fn=weight_average)
+
+    demo_model(model)
+    demo_image_generation(avg_model)
+
+    trainer = Trainer(model, avg_model, d_train)
+    trainer.train(n_seconds=60*60)
